@@ -1,0 +1,42 @@
+---
+# Read an Ed25519 key pair with support/generate_random_id.py and publish it as
+#   <role>_pk   base64 private key seed
+#   <role>_pub  base64 public key
+#   <role>_id   base64 ADNL short id
+#
+# Include with `loop_control: loop_var: keypair`, one item per key:
+#   keypair.role      variable prefix, e.g. fullnode
+#   keypair.file      path of the private key file
+#   keypair.generate  create the file when it is missing (default: false, fail instead)
+#
+# Requires: tools_path (checkout of ton-deploy), python3-nacl on the host.
+
+- name: Check for {{ keypair.role }} key file
+  ansible.builtin.stat:
+    path: "{{ keypair.file }}"
+  register: _keypair_file
+
+- name: Fail if the {{ keypair.role }} key file is missing
+  ansible.builtin.fail:
+    msg: "{{ keypair.role }} key file {{ keypair.file }} not found"
+  when: not _keypair_file.stat.isreg | default(false) and not keypair.generate | default(false) | bool
+
+- name: Generate {{ keypair.role }} key
+  ansible.builtin.command:
+    cmd: "{{ tools_path }}/support/generate_random_id.py --mode keys --name {{ keypair.file }}"
+  when: not _keypair_file.stat.exists
+
+- name: Read {{ keypair.role }} key
+  ansible.builtin.command:
+    cmd: "{{ tools_path }}/support/generate_random_id.py --mode id --dict --key {{ keypair.file }}"
+  register: _keypair_read
+  changed_when: false
+  check_mode: false
+
+- name: Publish {{ keypair.role }} key values
+  ansible.builtin.set_fact:
+    "{{ keypair.role }}_pk": "{{ _keypair.pk }}"
+    "{{ keypair.role }}_pub": "{{ _keypair.pub }}"
+    "{{ keypair.role }}_id": "{{ _keypair.adnl }}"
+  vars:
+    _keypair: "{{ _keypair_read.stdout | from_json }}"

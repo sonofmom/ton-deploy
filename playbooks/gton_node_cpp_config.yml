@@ -1,0 +1,185 @@
+---
+# Take over the identity of a C++ node installed with mytonctrl: stop it, read
+# its ports and keys, and configure an already deployed gton node with them.
+
+- hosts: all
+  vars:
+    # Node roles. Everything else lives in group_vars/all/gton_vars.yml.
+    validator_enabled: true
+    liteserver_enabled: true
+    collator_enabled: false
+    # C++ node installed with mytonctrl
+    cpp_data_path: "/var/ton-work"
+  tasks:
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Check if gton service {{ service_name }} exists
+      ansible.builtin.fail:
+        msg: "gton service {{ service_name }} is not present"
+      when: "service_name ~ '.service' not in ansible_facts.services"
+
+    - name: Stop and disable cpp validator service
+      ansible.builtin.systemd_service:
+        name: "validator"
+        state: stopped
+        enabled: false
+      tags: [stop_validator]
+
+    - name: Stop {{ service_name }} service
+      ansible.builtin.systemd_service:
+        name: "{{ service_name }}"
+        state: stopped
+
+    - name: Get the mytoncore user
+      ansible.builtin.command:
+        cmd: systemctl show mytoncore.service --property=User --value
+      register: _cpp_mytoncore_user
+      changed_when: false
+      check_mode: false
+      become: true
+
+    - name: Store mytoncore user
+      ansible.builtin.set_fact:
+        cpp_mytoncore_user: "{{ _cpp_mytoncore_user.stdout }}"
+
+    - name: Check mytoncore user
+      ansible.builtin.fail:
+        msg: "cpp_mytoncore_user is empty or set to root — refusing to configure the gton node."
+      when: cpp_mytoncore_user | length == 0 or cpp_mytoncore_user == 'root'
+
+    - name: Read fullnode port from the cpp node
+      ansible.builtin.shell:
+        cmd: "jq -r '.addrs[0].port' {{ cpp_data_path }}/db/config.json"
+      register: _cpp_fullnode_port
+      changed_when: false
+      when: fullnode_port | default('', true) == ''
+
+    - name: Store fullnode port
+      ansible.builtin.set_fact:
+        fullnode_port: "{{ _cpp_fullnode_port.stdout }}"
+      when: fullnode_port | default('', true) == ''
+
+    - name: Read console port from the cpp node
+      ansible.builtin.shell:
+        cmd: "jq -r '.control[0].port' {{ cpp_data_path }}/db/config.json"
+      register: _cpp_console_port
+      changed_when: false
+      when: console_port | default('', true) == ''
+
+    - name: Store console port
+      ansible.builtin.set_fact:
+        console_port: "{{ _cpp_console_port.stdout }}"
+      when: console_port | default('', true) == ''
+
+    - name: Read liteserver port from the cpp node
+      ansible.builtin.shell:
+        cmd: "jq -r '.liteservers[0].port' {{ cpp_data_path }}/db/config.json"
+      register: _cpp_liteserver_port
+      changed_when: false
+      when: liteserver_enabled | bool and liteserver_port | default('', true) == ''
+
+    - name: Store liteserver port
+      ansible.builtin.set_fact:
+        liteserver_port: "{{ _cpp_liteserver_port.stdout }}"
+      when: liteserver_enabled | bool and liteserver_port | default('', true) == ''
+
+    - name: Read fullnode key id from the cpp node
+      ansible.builtin.shell:
+        cmd: "jq -r '.fullnode' {{ cpp_data_path }}/db/config.json | base64 -d | xxd -p -u -c 256"
+      register: _cpp_fullnode_id
+      changed_when: false
+
+    - name: Store fullnode key id
+      ansible.builtin.set_fact:
+        cpp_fullnode_id_hex: "{{ _cpp_fullnode_id.stdout | trim }}"
+
+    - name: Read console server key id from the cpp node
+      ansible.builtin.shell:
+        cmd: "jq -r '.control[0].id' {{ cpp_data_path }}/db/config.json | base64 -d | xxd -p -u -c 256"
+      register: _cpp_console_server_id
+      changed_when: false
+
+    - name: Store console server key id
+      ansible.builtin.set_fact:
+        cpp_console_server_id_hex: "{{ _cpp_console_server_id.stdout | trim }}"
+
+    - name: Read liteserver key id from the cpp node
+      ansible.builtin.shell:
+        cmd: "jq -r '.liteservers[0].id' {{ cpp_data_path }}/db/config.json | base64 -d | xxd -p -u -c 256"
+      register: _cpp_liteserver_id
+      changed_when: false
+      when: liteserver_enabled | bool
+
+    - name: Store liteserver key id
+      ansible.builtin.set_fact:
+        cpp_liteserver_id_hex: "{{ _cpp_liteserver_id.stdout | trim }}"
+      when: liteserver_enabled | bool
+
+    - name: Read validator key id from mytoncore
+      ansible.builtin.shell:
+        cmd: "jq -r '.adnlAddr' /home/{{ cpp_mytoncore_user }}/.local/share/mytoncore/mytoncore.db"
+      register: _cpp_consensus_id
+      changed_when: false
+      when: validator_enabled | bool
+
+    - name: Store validator key id
+      ansible.builtin.set_fact:
+        cpp_consensus_id_hex: "{{ _cpp_consensus_id.stdout | trim }}"
+      when: validator_enabled | bool
+
+    - name: Read keys from the cpp node
+      ansible.builtin.include_tasks:
+        file: "{{ playbook_dir }}/../tasks/keypair.yml"
+        apply:
+          tags: [config_keys]
+      loop:
+        - role: fullnode
+          file: "{{ cpp_data_path }}/db/keyring/{{ cpp_fullnode_id_hex }}"
+          enabled: true
+        - role: console_server
+          file: "{{ cpp_data_path }}/db/keyring/{{ cpp_console_server_id_hex }}"
+          enabled: true
+        - role: console_client
+          file: "{{ cpp_data_path }}/keys/client"
+          enabled: true
+        - role: liteserver
+          file: "{{ cpp_data_path }}/db/keyring/{{ cpp_liteserver_id_hex | default('') }}"
+          enabled: "{{ liteserver_enabled }}"
+        - role: consensus
+          file: "{{ cpp_data_path }}/db/keyring/{{ cpp_consensus_id_hex | default('') }}"
+          enabled: "{{ validator_enabled }}"
+      loop_control:
+        loop_var: keypair
+        label: "{{ keypair.role }}"
+      when: keypair.enabled | bool and lookup('vars', keypair.role ~ '_pk', default='') == ''
+      tags: [config_keys]
+
+    - name: Check for cpp custom overlays file
+      ansible.builtin.stat:
+        path: "{{ cpp_data_path }}/db/custom-overlays.json"
+      register: _cpp_overlays_file
+      when: custom_overlays | length == 0
+
+    - name: Read cpp custom overlays
+      ansible.builtin.shell:
+        cmd: "jq -c '.overlays // []' {{ cpp_data_path }}/db/custom-overlays.json"
+      register: _cpp_overlays
+      changed_when: false
+      when: custom_overlays | length == 0 and _cpp_overlays_file.stat.exists
+
+    - name: Store cpp custom overlays
+      ansible.builtin.set_fact:
+        custom_overlays: "{{ _cpp_overlays.stdout | from_json }}"
+      when: custom_overlays | length == 0 and _cpp_overlays_file.stat.exists
+
+    - name: Configure node
+      ansible.builtin.include_tasks: gton_node_configure.yml
+      tags: [apply_config]
+
+    - name: Start {{ service_name }} service
+      ansible.builtin.systemd_service:
+        name: "{{ service_name }}"
+        state: started
+
+    - ansible.builtin.meta: end_play

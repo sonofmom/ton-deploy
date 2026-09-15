@@ -1,0 +1,130 @@
+---
+# Manage ufw allow rules keyed by comment.
+#
+# Input:  ufw_rules — list of "port:proto:src:comment" strings
+#           port    single port, 1-65535 (no ranges)
+#           proto   tcp | udp | any
+#           src     "any", or an IPv4 address / CIDR
+#           comment free text, may contain colons, must be unique
+#
+# The comment is the identity key: a rule carrying a managed comment
+# but a different port/proto/src/action is deleted and re-added.
+#
+# Requires: ufw active on the host, community.general collection.
+
+- name: Manage ufw rules
+  become: true
+  environment:
+    LC_ALL: C          # ufw's output is translated; pin it so the regexes hold
+  block:
+
+    - name: Read ufw state
+      ansible.builtin.command:
+        cmd: ufw status numbered
+      register: _ufw_status
+      changed_when: false
+      check_mode: false
+
+    - name: Stop here if ufw is inactive
+      ansible.builtin.assert:
+        that: _ufw_status.stdout is search('^Status:\s*active')
+        fail_msg: "ufw is inactive on {{ inventory_hostname }}; refusing to manage rules."
+        quiet: true
+
+    - name: Check the entry format
+      ansible.builtin.assert:
+        that:
+          - ufw_rules | default([]) | length > 0
+          - ufw_rules | map('string') | map('split', ':', 3) | map('length') | min == 4
+        fail_msg: >-
+          ufw_rules must be a non-empty list of "port:proto:src:comment" entries.
+          Three-field entries from the old format need ":any" inserted before
+          the comment, e.g. "8080:tcp:web ui" becomes "8080:tcp:any:web ui".
+        quiet: true
+
+    - name: Normalise the requested rules
+      ansible.builtin.set_fact:
+        _ufw_want: >-
+          {%- set out = [] -%}
+          {%- for r in ufw_rules -%}
+
+            {#- split from the left, maxsplit 3: everything after the
+                third colon belongs to the comment -#}
+            {%- set p = (r | string).split(':', 3) -%}
+            {%- set port    = p[0] | trim -%}
+            {%- set proto   = p[1] | trim -%}
+            {%- set src     = p[2] | trim -%}
+            {%- set comment = p[3] | trim -%}
+
+            {%- set portspec = port ~ ('/' ~ proto if proto != 'any' else '') -%}
+            {%- set _ = out.append({
+                  'port': port,
+                  'proto': proto,
+                  'src': src,
+                  'comment': comment,
+                  'portspec': portspec,
+                  'spec': 'ALLOW IN|' ~ portspec ~ '|' ~ src,
+                }) -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Validate the input
+      ansible.builtin.assert:
+        that:
+          - _ufw_want | rejectattr('port', 'match', '^[0-9]+$') | list | length == 0
+          - _ufw_want | map(attribute='port') | map('int') | select('lt', 1) | list | length == 0
+          - _ufw_want | map(attribute='port') | map('int') | select('gt', 65535) | list | length == 0
+          - _ufw_want | rejectattr('proto', 'in', ['tcp', 'udp', 'any']) | list | length == 0
+          - _ufw_want | rejectattr('src', 'match', '^(any|([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?)$')
+            | list | length == 0
+          - _ufw_want | rejectattr('comment', 'truthy') | list | length == 0
+          - _ufw_want | map(attribute='comment') | unique | length == _ufw_want | length
+        fail_msg: >-
+          Each entry must be "port:proto:src:comment" with a single port 1-65535,
+          proto in tcp/udp/any, src either "any" or an IPv4 address or CIDR,
+          a non-empty comment, and comments unique across the list.
+        quiet: true
+
+    - name: Map each managed comment to its wanted rule spec
+      ansible.builtin.set_fact:
+        _ufw_want_map: >-
+          {{ dict(_ufw_want | map(attribute='comment')
+                  | zip(_ufw_want | map(attribute='spec'))) }}
+
+    - name: Collect rule numbers whose comment we manage but whose rule is wrong
+      ansible.builtin.set_fact:
+        _ufw_stale: >-
+          {%- set pat = '^\\[\\s*(\\d+)\\]\\s+(\\S+)(?:\\s+\\(v6\\))?(?:\\s+on\\s+\\S+)?' ~
+                        '\\s+([A-Z]+(?:\\s+[A-Z]+)?)' ~
+                        '\\s+(\\S+)(?:\\s+\\(v6\\))?(?:\\s+on\\s+\\S+)?' ~
+                        '\\s*#\\s*(.*?)\\s*$' -%}
+          {%- set nums = [] -%}
+          {%- for line in _ufw_status.stdout_lines -%}
+            {%- set m = line | regex_search(pat, '\\1', '\\2', '\\3', '\\4', '\\5') -%}
+            {%- if m -%}
+              {%- set comment = m[4] -%}
+              {%- set action  = m[2] | regex_replace('\\s+', ' ') -%}
+              {%- set src     = 'any' if m[3] == 'Anywhere' else m[3] -%}
+              {%- set seen    = action ~ '|' ~ m[1] ~ '|' ~ src -%}
+              {%- if comment in _ufw_want_map and _ufw_want_map[comment] != seen -%}
+                {%- set _ = nums.append(m[0] | int) -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ nums | sort | reverse | list }}
+
+    - name: Delete stale rules, highest number first
+      ansible.builtin.command:
+        cmd: "ufw --force delete {{ item }}"
+      loop: "{{ _ufw_stale }}"
+
+    - name: Ensure every wanted rule exists
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+        from_ip: "{{ item.src }}"
+        comment: "{{ item.comment }}"
+      loop: "{{ _ufw_want }}"
+      loop_control:
+        label: "{{ item.portspec }} from {{ item.src }} ({{ item.comment }})"

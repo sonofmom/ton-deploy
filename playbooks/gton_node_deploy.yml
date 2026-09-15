@@ -1,0 +1,206 @@
+---
+
+- hosts: all
+  vars:
+    # Node roles. Everything else lives in group_vars/all/gton_vars.yml.
+    validator_enabled: false
+    liteserver_enabled: true
+    collator_enabled: false
+  tasks:
+    - name: Check if home path {{ home_path }} exists
+      ansible.builtin.stat:
+        path: "{{ home_path }}"
+      register: _home_path
+      tags: [preflight]
+
+    - name: Abort if {{ home_path }} exists
+      ansible.builtin.fail:
+        msg: "{{ home_path }} present — aborting on this host."
+      when: _home_path.stat.exists
+      tags: [preflight]
+
+    - name: Check if service file {{ service_file }} exists
+      ansible.builtin.stat:
+        path: "{{ service_file }}"
+      register: _service_file
+      tags: [preflight]
+
+    - name: Abort if {{ service_file }} exists
+      ansible.builtin.fail:
+        msg: "{{ service_file }} present — aborting on this host."
+      when: _service_file.stat.exists
+      tags: [preflight]
+
+    - name: Create {{ service_user }} system group
+      ansible.builtin.group:
+        name: "{{ service_user }}"
+        system: true
+      tags: [env]
+
+    - name: Create {{ service_user }} system user
+      ansible.builtin.user:
+        name: "{{ service_user }}"
+        group: "{{ service_user }}"
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+        home: "/var/lib/{{ service_user }}"
+        state: present
+      tags: [env]
+
+    - name: Create node paths
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ item.owner | default(service_user) }}"
+        group: "{{ item.group | default(service_user) }}"
+        mode: "{{ item.mode | default('0755') }}"
+      loop:
+        - path: "{{ db_path }}"
+        - path: "{{ etc_path }}"
+          mode: "0750"
+        - path: "{{ etc_path }}/keys"
+          mode: "0750"
+        - path: "{{ src_path }}"
+          owner: root
+        - path: "{{ bin_path }}"
+          owner: root
+        - path: "{{ log_path }}"
+      loop_control:
+        label: "{{ item.path }}"
+      tags: [env]
+
+    - name: Install golang
+      ansible.builtin.apt:
+        pkg:
+          - golang
+      tags: [build]
+
+    - name: Checkout gton git repository
+      ansible.builtin.git:
+        repo: "{{ repository_url }}"
+        dest: "{{ src_path }}"
+        version: "{{ repository_version }}"
+        recursive: true
+        force: true
+        update: true
+      tags: [build]
+
+    - name: Execute build
+      ansible.builtin.shell:
+        cmd: "go build -o gton-node ./cmd/node"
+        chdir: "{{ src_path }}"
+      tags: [build]
+
+    - name: Run gton-node binary
+      ansible.builtin.shell:
+        cmd: "{{ src_path }}/gton-node --help"
+      register: _help
+      tags: [build]
+
+    - name: Stop if broken
+      ansible.builtin.fail:
+        msg: "{{ src_path }}/gton-node binary did not produce expected output"
+      when: "'Usage of gton-node' not in _help.stderr"
+      tags: [build]
+
+    - name: Move binary into destination path
+      ansible.builtin.shell:
+        cmd: "mv {{ src_path }}/gton-node {{ bin_path }} && chmod 755 {{ bin_path }}/gton-node"
+      tags: [build]
+
+    - name: Download the global config
+      ansible.builtin.get_url:
+        url: "{{ global_config_url }}"
+        dest: "{{ etc_path }}/global.config.json"
+        mode: "0644"
+      tags: [init]
+
+    - name: Perform initialization gton-node run
+      ansible.builtin.shell:
+        cmd: "{{ bin_path }}/gton-node --config {{ etc_path }}/config.json"
+        creates: "{{ etc_path }}/config.json"
+      tags: [init]
+
+    - name: Configure node
+      ansible.builtin.include_tasks: gton_node_configure.yml
+      tags: [config]
+
+    - name: Generate service file
+      ansible.builtin.template:
+        src: "{{ service_template_file }}"
+        dest: "{{ service_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: service_enabled | bool
+      tags: [service]
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd_service:
+        name: "{{ service_name }}"
+        state: stopped
+        daemon_reload: true
+      when: service_enabled | bool
+      tags: [service]
+
+    - name: Enable {{ service_name }} systemd service
+      ansible.builtin.systemd_service:
+        name: "{{ service_name }}"
+        enabled: true
+        state: started
+      when: service_enabled | bool and service_start | bool
+      tags: [service]
+
+    - name: Copy rsyslog config
+      ansible.builtin.copy:
+        src: "{{ rsyslog_config_file }}"
+        dest: /etc/rsyslog.d/
+        owner: root
+        group: root
+        mode: "0644"
+      when: rsyslog_config_file | length > 0
+      tags: [rsyslog]
+
+    - name: Check whether rsyslogd has an AppArmor profile
+      ansible.builtin.stat:
+        path: /etc/apparmor.d/usr.sbin.rsyslogd
+      register: _rsyslog_apparmor
+      when: rsyslog_config_file | length > 0
+      tags: [rsyslog]
+
+    - name: Allow rsyslogd to read node logs
+      ansible.builtin.lineinfile:
+        path: /etc/apparmor.d/local/usr.sbin.rsyslogd
+        regexp: "{{ item.regexp }}"
+        line: "{{ item.line }}"
+        create: true
+        mode: "0644"
+      loop:
+        - regexp: '^{{ log_path | regex_escape }}/ '
+          line: "{{ log_path }}/ r,"
+        - regexp: '^{{ log_path | regex_escape }}/\*\* '
+          line: "{{ log_path }}/** r,"
+      loop_control:
+        label: "{{ item.line }}"
+      register: _rsyslog_apparmor_rules
+      when: rsyslog_config_file | length > 0 and _rsyslog_apparmor.stat.exists
+      become: true
+      tags: [rsyslog]
+
+    - name: Reload rsyslogd AppArmor profile
+      ansible.builtin.command:
+        cmd: apparmor_parser -r /etc/apparmor.d/usr.sbin.rsyslogd
+      when: rsyslog_config_file | length > 0 and _rsyslog_apparmor.stat.exists and _rsyslog_apparmor_rules is changed
+      become: true
+      tags: [rsyslog]
+
+    - name: Restart rsyslog service
+      ansible.builtin.systemd_service:
+        state: restarted
+        daemon_reload: true
+        name: "rsyslog"
+      when: rsyslog_config_file | length > 0
+      tags: [rsyslog]
+
+    - ansible.builtin.meta: end_play

@@ -1,0 +1,304 @@
+---
+# Configuration tasks shared by gton_node_deploy.yml and gton_node_cpp_config.yml.
+# Expects group_vars/all/gton_vars.yml and an existing {{ etc_path }}/config.json.
+# Inputs left empty (external_ip, ports, keys) are generated here.
+
+- name: Install pynacl
+  ansible.builtin.apt:
+    pkg:
+      - python3-nacl
+  tags: [config_env]
+
+- name: Clone ton-deploy tools
+  ansible.builtin.git:
+    repo: "{{ tools_repository_url }}"
+    dest: "{{ tools_path }}"
+  tags: [config_env]
+
+- name: Register external IP address of node
+  ansible.builtin.set_fact:
+    external_ip: "{{ external_ip | default('', true) or ansible_facts.default_ipv4.address }}"
+  tags: [config_vars]
+
+- name: Register ports of node
+  ansible.builtin.set_fact:
+    fullnode_port: "{{ fullnode_port | default('', true) or 60000 | random(start=10000) | int }}"
+    consensus_port: "{{ consensus_port | default('', true) or 60000 | random(start=10000) | int }}"
+    dht_port: "{{ dht_port | default('', true) or 60000 | random(start=10000) | int }}"
+    console_port: "{{ console_port | default('', true) or 60000 | random(start=10000) | int }}"
+    liteserver_port: "{{ liteserver_port | default('', true) or 60000 | random(start=10000) | int }}"
+    metrics_port: "{{ metrics_port | default('', true) or 60000 | random(start=10000) | int }}"
+  tags: [config_vars]
+
+- name: Register QUIC ports of node
+  ansible.builtin.set_fact:
+    fullnode_quic_port: "{{ fullnode_quic_port | default('', true) or fullnode_port | int + 1000 }}"
+    consensus_quic_port: "{{ consensus_quic_port | default('', true) or consensus_port | int + 1000 }}"
+  tags: [config_vars]
+
+- name: Generate node keys
+  ansible.builtin.include_tasks:
+    file: "{{ playbook_dir }}/../tasks/keypair.yml"
+    apply:
+      tags: [config_keys]
+  loop:
+    - role: fullnode
+      file: "{{ etc_path }}/keys/fullnode"
+      enabled: true
+      generate: true
+    - role: console_server
+      file: "{{ etc_path }}/keys/console_server"
+      enabled: true
+      generate: true
+    - role: console_client
+      file: "{{ etc_path }}/keys/console_client"
+      enabled: true
+      generate: true
+    - role: liteserver
+      file: "{{ etc_path }}/keys/liteserver"
+      enabled: "{{ liteserver_enabled }}"
+      generate: true
+    - role: consensus
+      file: "{{ etc_path }}/keys/consensus"
+      enabled: "{{ validator_enabled | bool or collator_enabled | bool }}"
+      generate: true
+  loop_control:
+    loop_var: keypair
+    label: "{{ keypair.role }}"
+  when: keypair.enabled | bool and lookup('vars', keypair.role ~ '_pk', default='') == ''
+  tags: [config_keys]
+
+- name: Set paths config
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg global_config "$GLOBAL_CONFIG"
+      --arg storage "$STORAGE"
+      '
+      .ton.global_config_path = $global_config |
+      .storage.dir = $storage
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    GLOBAL_CONFIG: "{{ etc_path }}/global.config.json"
+    STORAGE: "{{ db_path }}"
+  become: true
+  tags: [config_edit]
+
+- name: Configure full node (ADNL) block
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg key "$KEY"
+      --arg listen_addr "$LISTEN_ADDR"
+      --arg external_addr "$EXTERNAL_ADDR"
+      '
+      .adnl.key = $key |
+      .adnl.listen_addr = $listen_addr |
+      .adnl.external_addr = $external_addr
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    KEY: "{{ fullnode_pk }}"
+    LISTEN_ADDR: "0.0.0.0:{{ fullnode_port }}"
+    EXTERNAL_ADDR: "{{ external_ip }}:{{ fullnode_port }}"
+  become: true
+  tags: [config_edit]
+
+- name: Configure DHT block
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg listen_addr "$LISTEN_ADDR"
+      '
+      .dht.listen_addr = $listen_addr
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    LISTEN_ADDR: "0.0.0.0:{{ dht_port }}"
+  become: true
+  tags: [config_edit]
+
+- name: Configure consensus ADNL block
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg key "$KEY"
+      --arg listen_addr "$LISTEN_ADDR"
+      --arg external_addr "$EXTERNAL_ADDR"
+      '
+      .consensus_adnl.enabled = true |
+      .consensus_adnl.key = $key |
+      .consensus_adnl.listen_addr = $listen_addr |
+      .consensus_adnl.external_addr = $external_addr
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    KEY: "{{ consensus_pk }}"
+    LISTEN_ADDR: "0.0.0.0:{{ consensus_port }}"
+    EXTERNAL_ADDR: "{{ external_ip }}:{{ consensus_port }}"
+  become: true
+  when: validator_enabled | bool or collator_enabled | bool
+  tags: [config_edit]
+
+- name: Configure validator block
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg key "$KEY"
+      --arg listen_addr "$LISTEN_ADDR"
+      --arg client_id "$CLIENT_ID"
+      '
+      .validator.enabled = true |
+      .validator.control.key = $key |
+      .validator.control.listen_addr = $listen_addr |
+      .validator.control.clients[0].id = $client_id |
+      .validator.control.clients[0].permissions = 15
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    KEY: "{{ console_server_pk }}"
+    LISTEN_ADDR: "0.0.0.0:{{ console_port }}"
+    CLIENT_ID: "{{ console_client_id }}"
+  become: true
+  when: validator_enabled | bool
+  tags: [config_edit]
+
+- name: Configure liteserver block
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg key "$KEY"
+      --arg listen_addr "$LISTEN_ADDR"
+      '
+      .liteserver.enabled = true |
+      .liteserver.key = $key |
+      .liteserver.listen_addr = $listen_addr
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    KEY: "{{ liteserver_pk }}"
+    LISTEN_ADDR: "0.0.0.0:{{ liteserver_port }}"
+  become: true
+  when: liteserver_enabled | bool
+  tags: [config_edit]
+
+- name: Configure metrics block
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg listen_addr "$LISTEN_ADDR"
+      '
+      .metrics.enabled = true |
+      .metrics.listen_addr = $listen_addr
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    LISTEN_ADDR: "0.0.0.0:{{ metrics_port }}"
+  become: true
+  when: metrics_enabled | bool
+  tags: [config_edit]
+
+- name: Configure collator block
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      '
+      .collator.enabled = true
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  become: true
+  when: collator_enabled | bool
+  tags: [config_edit]
+
+- name: Inject custom overlays
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --argjson overlays "$OVERLAYS"
+      '
+      .custom_overlays = $overlays
+      '
+      {{ etc_path }}/config.json > {{ etc_path }}/.config.json.tmp
+      && mv {{ etc_path }}/.config.json.tmp {{ etc_path }}/config.json
+  environment:
+    OVERLAYS: "{{ custom_overlays | to_json }}"
+  become: true
+  when: custom_overlays | default([]) | length > 0
+  tags: [config_edit]
+
+- name: Convert external IP to signed 32-bit int
+  ansible.builtin.set_fact:
+    external_ip_int: >-
+      {%- set o = external_ip | trim | split('.') | map('int') | list -%}
+      {%- set u = o[0] * 16777216 + o[1] * 65536 + o[2] * 256 + o[3] -%}
+      {{ (u - 4294967296 if u > 2147483647 else u) | int }}
+  when: liteserver_enabled | bool
+  tags: [config_store]
+
+- name: Generate local lite-client config
+  ansible.builtin.shell:
+    cmd: >-
+      jq
+      --arg ip "$IP"
+      --arg port "$PORT"
+      --arg key "$KEY"
+      '
+      .liteservers = [{
+      ip: ($ip | tonumber),
+      port: ($port | tonumber),
+      id: {"@type": "pub.ed25519", key: $key}
+      }]
+      '
+      {{ etc_path }}/global.config.json > {{ etc_path }}/.local.config.json.tmp
+      && mv {{ etc_path }}/.local.config.json.tmp {{ etc_path }}/local.config.json
+  environment:
+    IP: "{{ external_ip_int | int }}"
+    PORT: "{{ liteserver_port | int }}"
+    KEY: "{{ liteserver_pub }}"
+  when: liteserver_enabled | bool
+  become: true
+  tags: [config_store]
+
+- name: UFW ruleset - base
+  ansible.builtin.set_fact:
+    ufw_rules:
+      - "{{ fullnode_port }}:udp:any:Gton node"
+      - "{{ fullnode_quic_port }}:udp:any:Gton node QUIC"
+      - "{{ dht_port }}:udp:any:Gton node dht"
+  when: ufw_enabled | bool
+  tags: [config_ufw]
+
+- name: UFW ruleset - consensus
+  ansible.builtin.set_fact:
+    ufw_rules: >-
+      {{
+      ufw_rules | default([])
+      + [consensus_port ~ ':udp:any:Gton node consensus']
+      + [consensus_quic_port ~ ':udp:any:Gton node consensus QUIC']
+      }}
+  when: ufw_enabled | bool and (validator_enabled | bool or collator_enabled | bool)
+  tags: [config_ufw]
+
+- name: UFW ruleset - liteserver
+  ansible.builtin.set_fact:
+    ufw_rules: >-
+      {{
+      ufw_rules | default([])
+      + [liteserver_port ~ ':tcp:any:Gton node liteserver']
+      }}
+  when: ufw_enabled | bool and liteserver_enabled | bool
+  tags: [config_ufw]
+
+- name: Configure UFW
+  ansible.builtin.include_tasks: "{{ playbook_dir }}/../tasks/ufw-rules.yml"
+  when: ufw_enabled | bool
+  tags: [config_ufw]
