@@ -1,0 +1,60 @@
+---
+
+- hosts: all
+  vars:
+    # Everything lives in group_vars/all/gton_vars.yml.
+    restart_service: 0
+  tasks:
+    - name: Check if home path {{ home_path }} exists
+      ansible.builtin.stat:
+        path: "{{ home_path }}"
+      register: _home_path
+      tags: [preflight]
+
+    - name: Abort if {{ home_path }} exists
+      ansible.builtin.fail:
+        msg: "{{ home_path }} is not present — aborting on this host."
+      when: not _home_path.stat.exists
+      tags: [preflight]
+
+    - name: Checkout gton git repository
+      ansible.builtin.git:
+        repo: "{{ repository_url }}"
+        dest: "{{ src_path }}"
+        version: "{{ repository_version }}"
+        recursive: true
+        force: true
+        update: true
+      tags: [build]
+
+    - name: Execute build
+      ansible.builtin.shell:
+        cmd: "go build -o gton-node ./cmd/node"
+        chdir: "{{ src_path }}"
+      tags: [build]
+
+    - name: Run gton-node binary
+      ansible.builtin.shell:
+        cmd: "{{ src_path }}/gton-node --help"
+      register: _help
+      tags: [build]
+
+    - name: Stop if broken
+      ansible.builtin.fail:
+        msg: "{{ src_path }}/gton-node binary did not produce expected output"
+      when: "'Usage of gton-node' not in _help.stderr"
+      tags: [build]
+
+    - name: Move binary into destination path
+      ansible.builtin.shell:
+        cmd: "mv {{ src_path }}/gton-node {{ bin_path }} && chmod 755 {{ bin_path }}/gton-node"
+      tags: [build]
+
+    - name: Restart {{ service_name }} service
+      ansible.builtin.systemd_service:
+        name: "{{ service_name }}"
+        state: restarted
+      when: restart_service | bool
+      tags: [build]
+
+    - ansible.builtin.meta: end_play
